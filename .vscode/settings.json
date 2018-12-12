@@ -1,0 +1,10 @@
+{
+  "files.associations": {
+    "*.arb": "ruby",
+    "*.cjsx": "coffeescript",
+    "*.css": "postcss",
+    "*.pcss": "postcss",
+    "*.md": "markdown",
+    "string": "cpp"
+  }
+}
