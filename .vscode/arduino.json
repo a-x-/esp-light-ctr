@@ -1,0 +1,6 @@
+{
+    "port": "/dev/cu.usbserial-A800HIEF",
+    "board": "esp8266:esp8266:generic",
+    "configuration": "CpuFrequency=160,VTable=flash,ResetMethod=ck,CrystalFreq=26,FlashFreq=80,FlashMode=qio,FlashSize=4M3M,led=2,LwIPVariant=v2mss536,Debug=Disabled,DebugLevel=None____,FlashErase=none,UploadSpeed=921600",
+    "programmer": "USBtinyISP"
+}

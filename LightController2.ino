@@ -1,26 +1,48 @@
+// #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
 // #include "McOffskyESPHttpClient.h"
+#include "config.h"
+
+#define null 0
 
 //
+
 // consts
 //
 
-// TODO: use EEPROM or config file
-// const char DEV_TYPE[] = "controller-slave";
-// const char DEV_ID[] = "lc--crd--1"; // light-controller--corridor--1
+const unsigned int HOUR = 1000 * 3600; // in ms
+const unsigned long corrTZ = 3; // +3h
 
-// const char MASTER_HOST[] = "rpi2main.local";
-
-const char SSID[] = "YOUR SSID";
-const char PASSW[] = "YOUR PASSWD";
-
+// see config.h
+// const char SSID[] = "";
+// const char PASSW[] = "";
 
 ESP8266WebServer server(80);
 
-const int startTime = millis();
+const unsigned long startTime = millis();
+
+
+//
+// NTP
+//
+unsigned int ntpLocalPort = 2390;      // local port to listen for UDP packets
+
+/* Don't hardwire the IP address or we won't get the benefits of the pool.
+    Lookup the IP address for the host name instead */
+//IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
+IPAddress timeServerIP; // time.nist.gov NTP server address
+const char* ntpServerName = "time.nist.gov";
+
+const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
+
+byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+
+// A UDP instance to let us send and receive packets over UDP
+WiFiUDP udp;
 
 //
 // pins
@@ -39,7 +61,8 @@ int buttonState;           // the current reading from the input pin
 int lastButtonState = LOW; // the previous reading from the input pin
 int buttonStateFixed;      // switch button state converted from push-button state
 bool isAutonomous = true;
-unsigned int autonomousDisaledAt = null; // todo
+unsigned long autonomousDisaledAt = null; // ms
+unsigned long startedAt = null; // s since 1970 aka epoch
 
 // the following variables are unsigned longs because the time, measured in
 // milliseconds, will quickly become a bigger number than can be stored in an int.
@@ -52,6 +75,7 @@ unsigned long debounceDelay = 50;   // the debounce time; increase if the output
 
 int lastMovingTime = 0;
 int prevMoving = false;
+bool isLightOn = false;
 
 //
 // life-cycle
@@ -62,12 +86,21 @@ void setup(void)
   //ets_intr_lock(15); // all intruptt off
   //ets_wdt_disable();
 
+  //
+  // pins
+  //
+  
   pinMode(buttonPin, INPUT);
   pinMode(pirPin, INPUT);
   pinMode(lightPin, OUTPUT);
-
   //  pinMode(led, OUTPUT);
   //  digitalWrite(led, 0);
+  isLightOn = digitalRead(lightPin);
+
+  //
+  // serial, wifi
+  //
+  
   Serial.begin(1000000);
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSW);
@@ -87,11 +120,19 @@ void setup(void)
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
+  //
+  // mDNS
+  //
+  
   if (MDNS.begin(DEV_ID))
   {
     Serial.println("MDNS responder started");
   }
 
+  //
+  // http server
+  //
+  
   server.on("/", handleRoot);
 
   // Commands
@@ -104,7 +145,7 @@ void setup(void)
 
   // Props
   server.on("/status", []() {
-    server.send(200, "text/plain", isLightOn() ? "on" : "off");
+    server.send(200, "text/plain", isLightOn ? "on" : "off");
   });
   server.on("/moving", []() {
     server.send(200, "text/plain", hasMoving() ? "yes" : "no");
@@ -120,6 +161,18 @@ void setup(void)
 
   server.begin();
   Serial.println("HTTP server started");
+
+  //
+  // ntp client
+  //
+
+  Serial.println("Starting UDP");
+  udp.begin(ntpLocalPort);
+  Serial.print("Local port: ");
+  Serial.println(udp.localPort());
+
+  getNtpTime();
+
 }
 
 void loop(void)
@@ -127,6 +180,7 @@ void loop(void)
   server.handleClient();
   debounceLightButton();
   reactLightOnMovement();
+  checkAutonomousMode();
 }
 
 //
@@ -162,17 +216,13 @@ void handleNotFound()
 bool toggleLight(int isOn)
 {
   digitalWrite(lightPin, isOn);
+  isLightOn = isOn;
   // reportLightState(isOn);
-  return isLightOn();
-}
-bool isLightOn(void)
-{
-  return digitalRead(lightPin);
+  return isLightOn;
 }
 bool hasMoving(void)
 {
-  prevMoving = digitalRead(pirPin);
-  return prevMoving;
+  return digitalRead(pirPin);
 }
 bool isButtonPressed(void)
 {
@@ -180,16 +230,13 @@ bool isButtonPressed(void)
 }
 const String getUptime(void)
 {
-  int delta = millis() - startTime;
+  unsigned int delta = millis() - startTime;
   //  char res[50];
 
-  int m = int((delta / (1000 * 60)) % 60);
-  int h = int((delta / (1000 * 60 * 60)) % 24);
-  int d = int((delta / (1000 * 60 * 60 * 24)) % 365);
+  unsigned int m = (unsigned int)((delta / (1000 * 60)) % 60);
+  unsigned int h = (unsigned int)((delta / (1000 * 60 * 60)) % 24);
+  unsigned int d = (unsigned int)((delta / (1000 * 60 * 60 * 24)) % 365);
 
-  //  os_sprintf(res, "%1.0d days, %2.0d:%2.0d:", d, h, m);
-  //  sprintf(res, "%d", delta);
-  //  return res; //f2s(delta, 0);
   return (String(d) + " days, " + String(h) + ":" + String(m));
 }
 
@@ -197,35 +244,127 @@ const String getUptime(void)
 // utils
 //
 
-// /* float to string
-//  * f is the float to turn into a string
-//  * p is the precision (number of decimals)
-//  * return a string representation of the float.
-//  */
-// char *f2s(float f, int p)
-// {
-//   char *pBuff;                  // use to remember which part of the buffer to use for dtostrf
-//   const int iSize = 10;         // number of bufffers, one for each float before wrapping around
-//   static char sBuff[iSize][20]; // space for 20 characters including NULL terminator for each float
-//   static int iCount = 0;        // keep a tab of next place in sBuff to use
-//   pBuff = sBuff[iCount];        // use this buffer
-//   if (iCount >= iSize - 1)
-//   {             // check for wrap
-//     iCount = 0; // if wrapping start again and reset
-//   } else {
-//     iCount++; // advance the counter
-//   }
-//   return dtostrf(f, 0, p, pBuff); // call the library function
-// }
 
-// void toggleAutonomousMode () {
-//   if (isAutonomous) {
-//     isAutonomous = false;
-//     // todo: disable for 8 hours
-//   } else {
-//     isAutonomous = true;
-//   }
-// }
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress& address) {
+  Serial.println("sending NTP packet...");
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  udp.beginPacket(address, 123); //NTP requests are to port 123
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+}
+
+
+void getNtpTime () {
+  printf("NTP Client: get a random server from the pool\n");
+  WiFi.hostByName(ntpServerName, timeServerIP);
+
+  sendNTPpacket(timeServerIP); // send an NTP packet to a time server
+  // wait to see if a reply is available
+  delay(1000);
+
+  int cb = udp.parsePacket();
+  if (!cb) {
+    Serial.println("no packet yet");
+  } else {
+    Serial.print("packet received, length=");
+    Serial.println(cb);
+    // We've received a packet, read the data from it
+    udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+
+    //the timestamp starts at byte 40 of the received packet and is four bytes,
+    // or two words, long. First, esxtract the two words:
+
+    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+    // combine the four bytes (two words) into a long integer
+    // this is NTP time (seconds since Jan 1 1900):
+    unsigned long secsSince1900 = highWord << 16 | lowWord;
+    Serial.print("Seconds since Jan 1 1900 = ");
+    Serial.println(secsSince1900);
+
+    // now convert NTP time into everyday time:
+    Serial.print("Unix time = ");
+    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
+    const unsigned long seventyYears = 2208988800UL;
+    // subtract seventy years:
+    unsigned long epoch = secsSince1900 - seventyYears;
+    startedAt = epoch;
+    // print Unix time:
+    Serial.println(epoch);
+
+
+    // print the hour, minute and second:
+    Serial.print("The UTC time is ");       // UTC is the time at Greenwich Meridian (GMT)
+    Serial.print((epoch  % 86400L) / 3600 + corrTZ); // print the hour (86400 equals secs per day)
+    Serial.print(':');
+    if (((epoch % 3600) / 60) < 10) {
+      // In the first 10 minutes of each hour, we'll want a leading '0'
+      Serial.print('0');
+    }
+    Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
+    Serial.print(':');
+    if ((epoch % 60) < 10) {
+      // In the first 10 seconds of each minute, we'll want a leading '0'
+      Serial.print('0');
+    }
+    Serial.println(epoch % 60); // print the second
+  }
+} // getNtpTime
+
+bool getNightTime () {
+  unsigned long hour = (getTimestamp() % 86400L) / 3600;
+  return hour > 0 && hour < 9;
+}
+
+// @returns epoch secs
+unsigned long getTimestamp () {
+  return startedAt + millis() / 1000 + corrTZ * 3600;
+}
+
+void toggleAutonomousMode()
+{
+  printf("toggleAutonomousMode\n");
+  if (isAutonomous)
+  {
+    isAutonomous = false;
+    // disable for 8 hours
+    autonomousDisaledAt = millis();
+    printf(" -> off\n");
+  }
+  else
+  {
+    // turn light on, enable autonomous mode again
+    isAutonomous = true;
+    autonomousDisaledAt = null;
+    printf(" -> on\n");
+  }
+}
+
+void checkAutonomousMode()
+{
+  if (millis() - autonomousDisaledAt > 8 * HOUR)
+  {
+    isAutonomous = true;
+    autonomousDisaledAt = null;
+    printf("checkAutonomousMode -> ON!\n");
+  }
+}
 
 void debounceLightButton()
 {
@@ -254,10 +393,13 @@ void debounceLightButton()
     if (reading != buttonState)
     {
       buttonState = reading;
-      if (buttonState == HIGH) {
+      if (buttonState == HIGH)
+      {
         buttonStateFixed = !buttonStateFixed;
+        printf("button: high edge\n");
       }
-      // toggleAutonomousMode();
+      toggleLight(buttonStateFixed);
+      toggleAutonomousMode();
       // todo PATCH //hub/controls/:id?value=:buttonState
     }
   }
@@ -265,18 +407,27 @@ void debounceLightButton()
 
 void reactLightOnMovement()
 {
-  if (hasMoving())
-  {
-    toggleLight(1);
-    if (!prevMoving)
-      printf("> moving <");
+  bool moving = hasMoving();
+  if (getNightTime() && isLightOn) {
+    printf("\nNight time --> No light\n");
+    toggleLight(0);
+    return;
+  }
+
+  if (millis() - lastMovingTime > HOUR && isLightOn) {
+    printf("moving timeout --> turn light off\n");
+    toggleLight(0);
+    return;
+  }
+  
+  if (moving) {
+    if (!isLightOn) {
+      toggleLight(1);
+      printf("> moving <\n");
+    }
     lastMovingTime = millis();
   }
-  else if (millis() - lastMovingTime > 3600 * 1000)
-  {
-    toggleLight(0);
-    printf("moving timeout --> turn light off");
-  }
+  prevMoving = moving;
 }
 
 // void reportMoving()
