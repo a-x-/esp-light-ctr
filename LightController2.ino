@@ -15,7 +15,7 @@
 //
 
 const unsigned int HOUR = 1000 * 3600; // in ms
-const unsigned long corrTZ = 3; // +3h
+const unsigned long corrTZ = 3 * 3600; // +3h, in secs
 
 // see config.h
 // const char SSID[] = "";
@@ -48,7 +48,6 @@ WiFiUDP udp;
 // pins
 //
 
-//const int led = 13;
 const int pirPin = 12;    // IN
 const int lightPin = 5;   // OUT; relay
 const int buttonPin = 14; // manual switcher
@@ -60,9 +59,6 @@ const int buttonPin = 14; // manual switcher
 int buttonState;           // the current reading from the input pin
 int lastButtonState = LOW; // the previous reading from the input pin
 int buttonStateFixed;      // switch button state converted from push-button state
-bool isAutonomous = true;
-unsigned long autonomousDisaledAt = null; // ms
-unsigned long startedAt = null; // s since 1970 aka epoch
 
 // the following variables are unsigned longs because the time, measured in
 // milliseconds, will quickly become a bigger number than can be stored in an int.
@@ -74,8 +70,11 @@ unsigned long debounceDelay = 50;   // the debounce time; increase if the output
 //
 
 int lastMovingTime = 0;
-int prevMoving = false;
 bool isLightOn = false;
+bool prevMoving = false;
+unsigned long startedAt = null; // s since 1970 aka epoch
+bool isAutonomous = true;
+unsigned long autonomousDisaledAt = null; // ms
 
 //
 // life-cycle
@@ -171,7 +170,7 @@ void setup(void)
   Serial.print("Local port: ");
   Serial.println(udp.localPort());
 
-  getNtpTime();
+  startedAt = getNtpTime();
 
 }
 
@@ -215,6 +214,8 @@ void handleNotFound()
 
 bool toggleLight(int isOn)
 {
+  if (isLightOn == isOn) return isOn;
+  
   digitalWrite(lightPin, isOn);
   isLightOn = isOn;
   // reportLightState(isOn);
@@ -270,7 +271,7 @@ void sendNTPpacket(IPAddress& address) {
 }
 
 
-void getNtpTime () {
+unsigned long getNtpTime () {
   printf("NTP Client: get a random server from the pool\n");
   WiFi.hostByName(ntpServerName, timeServerIP);
 
@@ -303,15 +304,14 @@ void getNtpTime () {
     // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
     const unsigned long seventyYears = 2208988800UL;
     // subtract seventy years:
-    unsigned long epoch = secsSince1900 - seventyYears;
-    startedAt = epoch;
+    unsigned long epoch = secsSince1900 - seventyYears + corrTZ;
     // print Unix time:
     Serial.println(epoch);
 
 
     // print the hour, minute and second:
     Serial.print("The UTC time is ");       // UTC is the time at Greenwich Meridian (GMT)
-    Serial.print((epoch  % 86400L) / 3600 + corrTZ); // print the hour (86400 equals secs per day)
+    Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
     Serial.print(':');
     if (((epoch % 3600) / 60) < 10) {
       // In the first 10 minutes of each hour, we'll want a leading '0'
@@ -324,6 +324,8 @@ void getNtpTime () {
       Serial.print('0');
     }
     Serial.println(epoch % 60); // print the second
+
+    return epoch;
   }
 } // getNtpTime
 
@@ -334,7 +336,7 @@ bool getNightTime () {
 
 // @returns epoch secs
 unsigned long getTimestamp () {
-  return startedAt + millis() / 1000 + corrTZ * 3600;
+  return startedAt + millis() / 1000;
 }
 
 void toggleAutonomousMode()
@@ -384,17 +386,14 @@ void debounceLightButton()
   // save the reading. Next time through the loop, it'll be the lastButtonState:
   lastButtonState = reading;
 
-  if ((millis() - lastDebounceTime) > debounceDelay)
-  {
+  if ((millis() - lastDebounceTime) > debounceDelay) {
     // whatever the reading is at, it's been there for longer than the debounce
     // delay, so take it as the actual current state:
 
     // if the button state has changed:
-    if (reading != buttonState)
-    {
+    if (reading != buttonState) {
       buttonState = reading;
-      if (buttonState == HIGH)
-      {
+      if (buttonState == HIGH) {
         buttonStateFixed = !buttonStateFixed;
         printf("button: high edge\n");
       }
@@ -408,25 +407,17 @@ void debounceLightButton()
 void reactLightOnMovement()
 {
   bool moving = hasMoving();
-  if (getNightTime() && isLightOn) {
-    printf("\nNight time --> No light\n");
-    toggleLight(0);
-    return;
+  bool shouldBeLight = millis() - lastMovingTime <= HOUR;
+  if (moving) lastMovingTime = millis();
+  
+  toggleLight(!getNightTime() && shouldBeLight);
+
+  if (prevMoving != moving) {
+    if (getNightTime()) printf("\nNight time --> No light\n");
+    if (!shouldBeLight) printf("moving timeout --> turn light off\n");
+    if (moving)         printf("> moving <\n");
   }
 
-  if (millis() - lastMovingTime > HOUR && isLightOn) {
-    printf("moving timeout --> turn light off\n");
-    toggleLight(0);
-    return;
-  }
-  
-  if (moving) {
-    if (!isLightOn) {
-      toggleLight(1);
-      printf("> moving <\n");
-    }
-    lastMovingTime = millis();
-  }
   prevMoving = moving;
 }
 
